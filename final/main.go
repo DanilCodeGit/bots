@@ -17,6 +17,7 @@ import (
 
 const (
 	webSocketURL = "wss://api.gateio.ws/ws/v4/"
+	finaltoken   = "7385636289:AAF54ZXLNkImvDB_x2IgvTSbXJx0OC2ymSU"
 	apiURL       = "https://api.gateio.ws/api/v4/spot/currency_pairs"
 )
 

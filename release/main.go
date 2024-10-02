@@ -1,35 +1,28 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"math"
 	"net/http"
+	_ "net/http/pprof"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/goccy/go-json"
 	"github.com/gorilla/websocket"
 	"gopkg.in/telebot.v3"
 )
 
 const (
 	webSocketURL = "wss://api.gateio.ws/ws/v4/"
+	releaseBot   = "7485182011:AAEi83d0-1K_YPpgqF76X0Qp-UBjgjJEKk4"
 	apiURL       = "https://api.gateio.ws/api/v4/spot/currency_pairs"
 )
 
-var (
-	candlestickData = make(map[string][]Trade)
-	mutex           sync.RWMutex
-	stopChan        chan bool
-	isRunning       bool
-	runMutex        sync.Mutex
-
-	userSettingsMutex sync.Mutex
-	userSettings      = make(map[int64]*UserSettings)
-)
+var isRunning bool
 
 type Trade struct {
 	ID           int    `json:"id"`
@@ -61,11 +54,45 @@ type CurrencyPair struct {
 	ID string `json:"id"`
 }
 
+type ProccesingEvent struct {
+	user         User
+	candlesticks Candlesticks
+}
+
+type Candlesticks struct {
+	sync.RWMutex
+	candlestickData map[string][]Trade
+}
+
+type User struct {
+	sync.RWMutex
+	userSettings map[int64]*UserSettings
+}
+
 type UserSettings struct {
 	MinVolume            float64
 	PriceChangeThreshold float64
 	IntervalDuration     time.Duration
 	LastProcessedTime    time.Time
+}
+
+func NewProccesingEvent() *ProccesingEvent {
+	return &ProccesingEvent{
+		user: User{
+			userSettings: make(map[int64]*UserSettings),
+		},
+		candlesticks: Candlesticks{
+			candlestickData: make(map[string][]Trade),
+		},
+	}
+}
+
+// Метод для добавления новых настроек пользователя
+func (p *User) AddUserSettings(chatID int64, settings *UserSettings) {
+	p.Lock()
+	defer p.Unlock()
+
+	p.userSettings[chatID] = settings
 }
 
 type PairMetrics struct {
@@ -78,6 +105,15 @@ type PairMetrics struct {
 }
 
 func main() {
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("Hello, World"))
+	})
+
+	// Профилирование доступно на порту 6060
+	go func() {
+		log.Println(http.ListenAndServe("localhost:6060", nil))
+	}()
+
 	pref := telebot.Settings{
 		Token:  releaseBot,
 		Poller: &telebot.LongPoller{Timeout: 5 * time.Second},
@@ -89,60 +125,57 @@ func main() {
 		return
 	}
 
+	procEvent := NewProccesingEvent()
+
 	bot.Handle("/start", func(c telebot.Context) error {
 		chatID := c.Chat().ID
-		userSettingsMutex.Lock()
-		if _, exists := userSettings[chatID]; exists {
-			userSettingsMutex.Unlock()
+
+		procEvent.user.Lock()
+		defer procEvent.user.Unlock()
+
+		if _, exists := procEvent.user.userSettings[chatID]; exists {
 			return c.Send("Вы уже зарегистрированы для получения уведомлений!")
 		}
-		userSettings[chatID] = &UserSettings{
+
+		procEvent.user.userSettings[chatID] = &UserSettings{
 			MinVolume:            1000.0,
 			PriceChangeThreshold: 2.0,
 			IntervalDuration:     5 * time.Second,
 			LastProcessedTime:    time.Now(),
 		}
-		userSettingsMutex.Unlock()
 
-		runMutex.Lock()
 		if !isRunning {
 			isRunning = true
-			runMutex.Unlock()
-			stopChan = make(chan bool)
-			go startWebSocketAndSendNotifications(bot) // Запускаем горутину при старте
-		} else {
-			runMutex.Unlock()
+			go procEvent.startWebSocketAndSendNotifications(bot)
+			return c.Send("Вы успешно зарегистрированы для получения уведомлений!")
 		}
 
-		return c.Send("Вы успешно зарегистрированы для получения уведомлений!")
+		return c.Send("Вы уже зарегистрированы для получения уведомлений!")
 	})
 
-	// Логгирование команд
 	bot.Handle("/percent", func(c telebot.Context) error {
-		log.Println("Received command: /percent")
 		args := c.Args()
 		if len(args) == 0 {
 			return c.Send("Пожалуйста, укажите процент отклонения, например: /percent 2.5")
 		}
 		value, err := strconv.ParseFloat(args[0], 64)
 		if err != nil {
-			return c.Send("Неверный формат числа. Пожалуйста, введите число, например: /percent 2.5")
+			return c.Send("Неверный формат числа. Пример: /percent 2.5")
 		}
 
 		chatID := c.Chat().ID
-		userSettingsMutex.Lock()
-		if settings, exists := userSettings[chatID]; exists {
+
+		procEvent.user.Lock()
+		defer procEvent.user.Unlock()
+		if settings, exists := procEvent.user.userSettings[chatID]; exists {
 			settings.PriceChangeThreshold = value
-			userSettingsMutex.Unlock()
 			return c.Send(fmt.Sprintf("Процент отклонения успешно установлен на %.2f%%", value))
-		} else {
-			userSettingsMutex.Unlock()
-			return c.Send("Вы не зарегистрированы. Пожалуйста, введите /start для регистрации.")
 		}
+
+		return c.Send("Вы не зарегистрированы. Пожалуйста, введите /start для регистрации.")
 	})
 
 	bot.Handle("/volume", func(c telebot.Context) error {
-		log.Println("Received command: /volume")
 		args := c.Args()
 		if len(args) == 0 {
 			return c.Send("Пожалуйста, укажите минимальный объем, например: /volume 5000")
@@ -153,19 +186,17 @@ func main() {
 		}
 
 		chatID := c.Chat().ID
-		userSettingsMutex.Lock()
-		if settings, exists := userSettings[chatID]; exists {
+		procEvent.user.Lock()
+		defer procEvent.user.Unlock()
+		if settings, exists := procEvent.user.userSettings[chatID]; exists {
 			settings.MinVolume = value
-			userSettingsMutex.Unlock()
 			return c.Send(fmt.Sprintf("Минимальный объем успешно установлен на %.2f", value))
-		} else {
-			userSettingsMutex.Unlock()
-			return c.Send("Вы не зарегистрированы. Пожалуйста, введите /start для регистрации.")
 		}
+
+		return c.Send("Вы не зарегистрированы. Пожалуйста, введите /start для регистрации.")
 	})
 
 	bot.Handle("/interval", func(c telebot.Context) error {
-		log.Println("Received command: /interval")
 		args := c.Args()
 		if len(args) == 0 {
 			return c.Send("Пожалуйста, укажите интервал свечи, например: /interval 10s или 1m")
@@ -176,30 +207,27 @@ func main() {
 		}
 
 		chatID := c.Chat().ID
-		userSettingsMutex.Lock()
-		if settings, exists := userSettings[chatID]; exists {
+		procEvent.user.Lock()
+		defer procEvent.user.Unlock()
+		if settings, exists := procEvent.user.userSettings[chatID]; exists {
 			settings.IntervalDuration = value
-			userSettingsMutex.Unlock()
 			return c.Send(fmt.Sprintf("Интервал свечи успешно установлен на %s", value))
-		} else {
-			userSettingsMutex.Unlock()
-			return c.Send("Вы не зарегистрированы. Пожалуйста, введите /start для регистрации.")
 		}
+
+		return c.Send("Вы не зарегистрированы. Пожалуйста, введите /start для регистрации.")
 	})
 
 	bot.Start()
 }
 
-func startWebSocketAndSendNotifications(bot *telebot.Bot) {
+func (p *ProccesingEvent) startWebSocketAndSendNotifications(bot *telebot.Bot) {
 	defer func() {
-		runMutex.Lock()
 		isRunning = false
-		runMutex.Unlock()
 	}()
 
 	log.Println("Starting WebSocket connection")
 
-	pairs, err := getUSDTTradingPairs()
+	pairs, err := p.getUSDTTradingPairs()
 	if err != nil {
 		log.Fatal("Ошибка получения списка торговых пар:", err)
 	}
@@ -212,7 +240,6 @@ func startWebSocketAndSendNotifications(bot *telebot.Bot) {
 
 	for _, pair := range pairs {
 		subscribeMessage := map[string]interface{}{
-			"time":    int(time.Now().Unix()),
 			"channel": "spot.trades",
 			"event":   "subscribe",
 			"payload": []string{pair},
@@ -225,23 +252,20 @@ func startWebSocketAndSendNotifications(bot *telebot.Bot) {
 	}
 
 	// Чтение сообщений из WebSocket
-	go readWebSocketMessages(conn)
+	go p.readWebSocketMessages(conn)
 
-	ticker := time.NewTicker(8 * time.Second)
+	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-stopChan:
-			log.Println("Остановлено формирование свечей.")
-			return
 		case <-ticker.C:
-			processCandlestickData(bot)
+			p.processCandlestickData(bot)
 		}
 	}
 }
 
-func readWebSocketMessages(conn *websocket.Conn) {
+func (p *ProccesingEvent) readWebSocketMessages(conn *websocket.Conn) {
 	log.Println("Started reading WebSocket messages")
 	for {
 		_, message, err := conn.ReadMessage()
@@ -265,57 +289,57 @@ func readWebSocketMessages(conn *websocket.Conn) {
 				continue
 			}
 
-			mutex.Lock()
-			candlestickData[trade.CurrencyPair] = append(candlestickData[trade.CurrencyPair], trade)
-			mutex.Unlock()
+			p.candlesticks.Lock()
+			p.candlesticks.candlestickData[trade.CurrencyPair] = append(p.candlesticks.candlestickData[trade.CurrencyPair], trade)
+			p.candlesticks.Unlock()
 		}
 	}
 }
 
-func processCandlestickData(bot *telebot.Bot) {
+func (p *ProccesingEvent) processCandlestickData(bot *telebot.Bot) {
 	log.Println("Processing candlestick data")
-	mutex.RLock()
-	if len(candlestickData) == 0 {
-		mutex.RUnlock()
+
+	p.candlesticks.RLock()
+	if len(p.candlesticks.candlestickData) == 0 {
+		p.candlesticks.RUnlock()
 		return
 	}
 
 	candlestickDataCopy := make(map[string][]Trade)
-	for pair, trades := range candlestickData {
+	for pair, trades := range p.candlesticks.candlestickData {
 		tradesCopy := make([]Trade, len(trades))
 		copy(tradesCopy, trades)
 		candlestickDataCopy[pair] = tradesCopy
 	}
-	mutex.RUnlock()
+	p.candlesticks.RUnlock()
 
 	var wg sync.WaitGroup
 	for pair, trades := range candlestickDataCopy {
 		wg.Add(1)
 		go func(pair string, trades []Trade) {
 			defer wg.Done()
-			metrics := computeMetrics(trades)
+			metrics := p.computeMetrics(trades)
 			if metrics != nil {
 				log.Printf("Metrics computed for pair %s: %+v", pair, metrics)
-				notifyUsers(pair, metrics, bot)
+				p.notifyUsers(pair, metrics, bot)
 			}
 		}(pair, trades)
 	}
 	wg.Wait()
 
-	mutex.Lock()
-	for pair := range candlestickData {
-		candlestickData[pair] = nil
+	p.candlesticks.Lock()
+	for pair := range p.candlesticks.candlestickData {
+		p.candlesticks.candlestickData[pair] = nil
 	}
-	mutex.Unlock()
+	p.candlesticks.Unlock()
 }
 
-func notifyUsers(pair string, metrics *PairMetrics, bot *telebot.Bot) {
-	log.Printf("Sending notifications for pair %s", pair)
-	userSettingsMutex.Lock()
-	defer userSettingsMutex.Unlock()
+func (p *ProccesingEvent) notifyUsers(pair string, metrics *PairMetrics, bot *telebot.Bot) {
+	p.user.Lock()
+	defer p.user.Unlock()
 
 	currentTime := time.Now()
-	for chatID, settings := range userSettings {
+	for chatID, settings := range p.user.userSettings {
 		if currentTime.Sub(settings.LastProcessedTime) >= settings.IntervalDuration &&
 			metrics.TotalVolume > settings.MinVolume &&
 			math.Abs(metrics.PriceChangePercent) > settings.PriceChangeThreshold {
@@ -339,7 +363,7 @@ func notifyUsers(pair string, metrics *PairMetrics, bot *telebot.Bot) {
 	}
 }
 
-func computeMetrics(trades []Trade) *PairMetrics {
+func (p *ProccesingEvent) computeMetrics(trades []Trade) *PairMetrics {
 	if len(trades) == 0 {
 		return nil
 	}
@@ -386,7 +410,7 @@ func computeMetrics(trades []Trade) *PairMetrics {
 	}
 }
 
-func getUSDTTradingPairs() ([]string, error) {
+func (p *ProccesingEvent) getUSDTTradingPairs() ([]string, error) {
 	resp, err := http.Get(apiURL)
 	if err != nil {
 		return nil, fmt.Errorf("ошибка получения торговых пар: %v", err)
